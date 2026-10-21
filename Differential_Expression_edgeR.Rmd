@@ -15,7 +15,6 @@ library(edgeR)
 library(ggplot2)
 library(ggrepel)
 library(DT)
-print("hello")
 ```
 
 ```{r}
@@ -172,6 +171,8 @@ contrasts <- makeContrasts(
 contrast_groups <- list(
   AR1_vs_MCF7 = c(pos = "AR1_MCF7", neg = "MCF7")
 )
+
+contrast_groups
 ```
 
 #### Visualization
