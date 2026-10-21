@@ -1,0 +1,316 @@
+---
+title: "edgeR Analysis"
+author: "Vida Talebian"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+
+#### Load packages and data
+
+Load the necessary packages, they are installed and ready to use. On your own environment you might need to install them for the first time.
+
+```{r}
+library(edgeR)
+library(ggplot2)
+library(ggrepel)
+library(DT)
+print("hello")
+```
+
+```{r}
+# work in your workspace directory
+setwd("~/workspace/Module6/expression/")
+
+count_file <- "expression_data.txt"
+metadata_file <- "sample_metadata.txt"
+
+counts <- read.delim(count_file, row.names = 1, check.names = FALSE, stringsAsFactors = FALSE)
+metadata <- read.delim(metadata_file, stringsAsFactors = FALSE)
+
+metadata$group <- factor(metadata$group)
+count_mat <- as.matrix(counts)
+
+dim(count_mat)
+head(count_mat)
+
+DT::datatable(metadata, rownames = FALSE, options = list(dom = "t"))
+```
+
+#### Make a DGEList object
+
+edgeR stores counts, sample info, and (later) normalization factors and dispersions together in a single `DGEList` object.
+
+```{r}
+dge <- DGEList(counts = count_mat, group = metadata$group)
+dge$samples
+```
+
+#### QC: sequencing depth per sample
+
+Large differences in library size are expected and are exactly what normalization corrects for -- but it's worth checking there isn't a sample with a dramatically low read count, which could indicate a failed library.
+
+```{r}
+libsize_df <- data.frame(sample   = factor(colnames(dge), levels = colnames(dge)),
+                          lib_size = dge$samples$lib.size / 1e6,
+                          group    = metadata$group)
+
+ggplot(libsize_df, aes(x = sample, y = lib_size, fill = group)) +
+  geom_col() +
+  labs(title = "Sequencing depth per sample", x = NULL,
+       y = "Library size (millions)", fill = "Group") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid.major.x = element_blank(),
+        plot.margin = margin(5.5, 5.5, 11, 11))
+```
+
+#### Filter out low-count genes
+
+Genes with very few reads across all samples carry little statistical power and mostly add noise (and multiple-testing burden) to the analysis. edgeR's `filterByExpr()` keeps genes with enough counts to be reliably tested in at least one group.
+
+```{r}
+keep <- filterByExpr(dge, group = metadata$group)
+cat(sprintf("Keeping %d of %d genes\n", sum(keep), length(keep)))
+```
+
+The density plot below compares log-CPM distributions before and after filtering -- the discarded genes are the peak of near-zero-count genes on the far left.
+
+```{r}
+logcpm_before <- edgeR::cpm(dge, log = TRUE)
+logcpm_kept   <- logcpm_before[keep, , drop = FALSE]
+
+density_df <- rbind(
+  data.frame(logcpm = as.vector(logcpm_before), sample = rep(colnames(dge), each = nrow(logcpm_before)), set = "before filtering"),
+  data.frame(logcpm = as.vector(logcpm_kept),   sample = rep(colnames(dge), each = nrow(logcpm_kept)),   set = "after filtering")
+)
+
+ggplot(density_df, aes(x = logcpm, group = interaction(sample, set), color = set)) +
+  geom_density() +
+  scale_color_manual(values = c("before filtering" = "grey70", "after filtering" = "steelblue")) +
+  labs(title = "log-CPM density before/after filtering", x = "log-CPM", y = "Density", color = NULL) +
+  theme_minimal(base_size = 12)
+```
+
+Apply the gene filter to the data
+
+```{r}
+dge <- dge[keep, , keep.lib.sizes = FALSE]
+```
+
+#### Normalize with TMM
+
+Trimmed Mean of M-values (TMM) normalization corrects for differences in RNA composition between samples (not just sequencing depth), which keeps highly-expressed genes in one sample from skewing the comparison.
+
+```{r}
+dge <- calcNormFactors(dge, method = "TMM")
+dge$samples
+```
+
+#### QC: MDS plot
+
+A multidimensional scaling (MDS) plot is edgeR's version of PCA -- samples that are more similar in expression sit closer together. We expect replicates to cluster and the two groups to separate.
+
+```{r}
+mds <- plotMDS(dge, plot = FALSE)
+var_pct <- round(100 * mds$var.explained[mds$dim.plot])
+mds_df <- data.frame(dim1 = mds$x, dim2 = mds$y,
+                      sample = colnames(dge), group = metadata$group)
+
+ggplot(mds_df, aes(x = dim1, y = dim2, color = group)) +
+  geom_point(size = 3) +
+  ggrepel::geom_text_repel(aes(label = sample), size = 3, color = "grey30",
+                            show.legend = FALSE, max.overlaps = Inf,
+                            box.padding = 0.4, segment.color = "grey60") +
+  labs(title = "MDS plot (all samples)",
+       x = sprintf("Leading logFC dim %d (%d%%)", mds$dim.plot[1], var_pct[1]),
+       y = sprintf("Leading logFC dim %d (%d%%)", mds$dim.plot[2], var_pct[2]),
+       color = "Group") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "right")
+```
+
+#### Design matrix and dispersion estimation
+
+We build one design matrix for the two groups and estimate dispersion using all 6 samples together, which gives a more stable estimate than fitting each sample individually.
+
+```{r}
+design <- model.matrix(~0 + group, data = metadata)
+colnames(design) <- levels(metadata$group)
+
+design
+```
+
+```{r}
+dge <- estimateDisp(dge, design, robust = TRUE)
+cat(sprintf("Common dispersion: %.4f (BCV = %.3f)\n",
+            dge$common.dispersion, sqrt(dge$common.dispersion)))
+```
+
+The biological coefficient of variation (BCV) plot shows how variance (dispersion) changes with expression level -- lowly-expressed genes are typically noisier (higher BCV).
+
+```{r}
+plotBCV(dge, main = "Biological coefficient of variation")
+```
+
+#### Fit the model and define contrasts
+
+We use a quasi-likelihood (QL) F-test (`glmQLFit`/`glmQLFTest`), which is recommended by edgeR for bulk RNA-seq as it accounts for uncertainty in the dispersion estimate and gives more robust error control than the classic likelihood-ratio test.
+
+```{r}
+fit <- glmQLFit(dge, design, robust = TRUE)
+```
+
+A contrast is defined as `pos - neg`, so a **positive logFC means higher expression in `pos`**, and a negative logFC means higher expression in `neg`. We keep track of that mapping so the volcano plot can label the axis accordingly.
+
+```{r}
+contrasts <- makeContrasts(
+  AR1_vs_MCF7 = AR1_MCF7 - MCF7,
+  levels = design
+)
+
+contrast_groups <- list(
+  AR1_vs_MCF7 = c(pos = "AR1_MCF7", neg = "MCF7")
+)
+```
+
+#### Visualization
+
+Helper functions for visualization
+
+The same steps can be reused for any contrast (you can run a different one yourself on the practice dataset at the end), we define one function that runs the test, tables, and plots for a given contrast, and one helper that picks which genes to label on the volcano plot.
+
+Genes are ranked by a blend of significance (FDR) and effect size (\|log2FC\|), so the labeled genes are both strongly *and* significantly changed rather than just the single most extreme metric; up to 15 genes are labeled on each side (Up / Down).
+
+```{r}
+top_labels <- function(df, n = 15) {
+  if (nrow(df) == 0) return(character(0))
+  combined_rank <- rank(df$FDR, ties.method = "average") +
+    rank(-abs(df$logFC), ties.method = "average")
+  df$gene[order(combined_rank)][seq_len(min(n, nrow(df)))]
+}
+
+run_contrast <- function(contrast_name) {
+  qlf <- glmQLFTest(fit, contrast = contrasts[, contrast_name])
+
+  ## adjust.method = "BH" (Benjamini-Hochberg) controls the false discovery
+  ## rate across all genes tested; it is edgeR's default, spelled out here
+  ## since the FDR column drives both the significance calls and the
+  ## volcano plot's y-axis.
+  tt <- topTags(qlf, n = Inf, sort.by = "PValue", adjust.method = "BH")$table
+  tt$gene <- rownames(tt)
+  tt <- tt[, c("gene", setdiff(colnames(tt), "gene"))]
+
+  fdr_cutoff <- 0.05
+  fc_cutoff  <- 1
+  pos_group  <- contrast_groups[[contrast_name]][["pos"]]
+  neg_group  <- contrast_groups[[contrast_name]][["neg"]]
+
+  tt$negLog10FDR <- -log10(pmax(tt$FDR, 1e-300))
+  tt$status <- "Not sig."
+  tt$status[tt$FDR < fdr_cutoff & tt$logFC >=  fc_cutoff] <- "Up"
+  tt$status[tt$FDR < fdr_cutoff & tt$logFC <= -fc_cutoff] <- "Down"
+  tt$status <- factor(tt$status, levels = c("Down", "Not sig.", "Up"))
+
+  list(qlf = qlf, table = tt, pos = pos_group, neg = neg_group,
+       fdr_cutoff = fdr_cutoff, fc_cutoff = fc_cutoff)
+}
+
+plot_ma <- function(result, contrast_name) {
+  plotMD(result$qlf, main = sprintf("MA plot: %s", contrast_name))
+  abline(h = 0, col = "grey40")
+}
+
+plot_volcano <- function(result, contrast_name) {
+  tt <- result$table
+  up_labels   <- top_labels(tt[tt$status == "Up", ],   n = 15)
+  down_labels <- top_labels(tt[tt$status == "Down", ], n = 15)
+  tt$label <- ifelse(tt$gene %in% c(up_labels, down_labels), tt$gene, NA)
+
+  n_up   <- sum(tt$status == "Up")
+  n_down <- sum(tt$status == "Down")
+  x_range <- range(tt$logFC, na.rm = TRUE)
+  y_min   <- min(tt$negLog10FDR, na.rm = TRUE)
+
+  ggplot(tt, aes(x = logFC, y = negLog10FDR, color = status)) +
+    geom_point(alpha = 0.6, size = 1.4) +
+    geom_vline(xintercept = c(-result$fc_cutoff, result$fc_cutoff), linetype = "dashed", color = "grey50") +
+    geom_hline(yintercept = -log10(result$fdr_cutoff), linetype = "dashed", color = "grey50") +
+    ggrepel::geom_text_repel(aes(label = label), color = "black", size = 3,
+                              max.overlaps = Inf, min.segment.length = 0,
+                              box.padding = 0.4, segment.color = "grey40",
+                              na.rm = TRUE, show.legend = FALSE) +
+    scale_color_manual(values = c("Down" = "#0072B2", "Not sig." = "grey80", "Up" = "#D55E00"),
+                        drop = FALSE) +
+    annotate("text", x = x_range[1], y = y_min, label = paste("<- higher in", result$neg),
+             hjust = 0, vjust = 1.5, size = 3, color = "grey40", fontface = "italic") +
+    annotate("text", x = x_range[2], y = y_min, label = paste("higher in", result$pos, "->"),
+             hjust = 1, vjust = 1.5, size = 3, color = "grey40", fontface = "italic") +
+    labs(title = sprintf("Volcano plot: %s", contrast_name),
+         subtitle = sprintf("%d up / %d down (BH FDR < %.2f, |log2FC| >= %g); labeled: up to 15 per side (FDR + |FC|)",
+                             n_up, n_down, result$fdr_cutoff, result$fc_cutoff),
+         x = sprintf("log2 fold-change (%s vs %s)", result$pos, result$neg),
+         y = "-log10(FDR, BH-adjusted)",
+         color = NULL) +
+    coord_cartesian(clip = "off") +
+    theme_minimal(base_size = 12) +
+    theme(plot.title = element_text(face = "bold"),
+          plot.subtitle = element_text(color = "grey30", size = 9),
+          panel.grid.minor = element_blank(),
+          legend.position = "top",
+          plot.margin = margin(5.5, 5.5, 11, 5.5))
+}
+```
+
+#### AR1_MCF7 vs MCF7
+
+In the following steps we will use the helper functions to run the differential analysis and visualize results.
+
+Compare Abemaciclib resistant MCF7 cells to the parental MCF7 samples.
+
+```{r}
+res_ar1 <- run_contrast("AR1_vs_MCF7")
+
+# write results table
+write.table(res_ar1$qlf, "AR1_vs_MCF7.txt", sep = '\t')
+
+# View summary
+summary(decideTests(res_ar1$qlf))
+```
+
+Create mean-difference plot (aka MA plot) which shows log fold-changes on the y-axis against average expression on the x-axis, and colour highlights differentially expressed genes in a fitted model.
+
+```{r}
+plot_ma(res_ar1, "AR1_vs_MCF7")
+```
+
+Generate the volcano plot, colour and label the differentially expressed genes.
+
+```{r}
+plot_volcano(res_ar1, "AR1_vs_MCF7")
+```
+
+Explore the complete table of DE results
+
+```{r}
+DT::datatable(res_ar1$table[, c("gene", "logFC", "logCPM", "PValue", "FDR")],
+              rownames = FALSE, filter = "top",
+              options = list(pageLength = 10)) |>
+  DT::formatSignif(columns = c("logFC", "logCPM", "PValue", "FDR"), digits = 3)
+```
+
+For practice, you can copy/download the practice data from `~/CourseData/Module6/practice/expression/practice_expression_data.txt` and `~/CourseData/Module6/practice/expression/practice_sample_metadata.txt` and make the changes in this script for differential expression analysis between the two drug resistant cell groups, Abemaciclib-resistant (AR_MCF7) vs. Palbociclib-resistant (PR_MCF7)
+
+<details>
+
+<summary>Show Hints</summary>
+
+*Hints:*
+
+- add the respective file paths to the above R script
+- pay attention to the new `design` matrix generated with the sample metadata
+- make changes to the `contrasts` and `contrast_groups` using the sample names from `design`
+- helper functions remain the same
+- run the final steps with the new contrasts for PR vs AR sample groups
+
+</details>
