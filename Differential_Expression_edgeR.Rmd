@@ -146,7 +146,7 @@ cat(sprintf("Common dispersion: %.4f (BCV = %.3f)\n",
             dge$common.dispersion, sqrt(dge$common.dispersion)))
 ```
 
-The biological coefficient of variation (BCV) plot shows how variance (dispersion) changes with expression level -- lowly-expressed genes are typically noisier (higher BCV).
+The biological coefficient of variation (BCV) plot shows how variance (dispersion) changes with expression level -- lowly-expressed genes are typically noisier (higher BCV). BCV is roughly the relative amount by which a gene’s true expression varies between replicates. A BCV of 0.3 means expression typically differs by about 30% from one replicate to the next.
 
 ```{r}
 plotBCV(dge, main = "Biological coefficient of variation")
